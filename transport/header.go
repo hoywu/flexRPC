@@ -27,17 +27,22 @@ type HeaderDecoder struct {
 	r io.Reader
 }
 
-func NewHeaderEncoder(w io.Writer) *HeaderEncoder {
-	return &HeaderEncoder{w: w}
-}
-
-func (e *HeaderEncoder) Encode(codec codec.CodecType) error {
+func NewHeaderBuf(codec codec.CodecType) []byte {
 	var buf [4]byte
 	buf[0] = byte(MagicNum >> 8)
 	buf[1] = byte(MagicNum & 0xff)
 	buf[2] = Version
 	buf[3] = codec
-	_, err := e.w.Write(buf[:])
+	return buf[:]
+}
+
+func NewHeaderEncoder(w io.Writer) *HeaderEncoder {
+	return &HeaderEncoder{w: w}
+}
+
+func (e *HeaderEncoder) Encode(codec codec.CodecType) error {
+	buf := NewHeaderBuf(codec)
+	_, err := e.w.Write(buf)
 	return err
 }
 

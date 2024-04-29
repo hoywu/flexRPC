@@ -8,8 +8,8 @@ type CodecType = byte
 
 const (
 	// 在这里定义编解码器类型
-	GobCodecByte  = 0x01
-	JsonCodecByte = 0x02
+	GobCodecType  = 0x01
+	JsonCodecType = 0x02
 )
 
 type Codec interface {
@@ -22,7 +22,7 @@ type NewCodecFunc func(io.ReadWriteCloser) Codec
 
 var CodecImpl map[CodecType]NewCodecFunc = map[CodecType]NewCodecFunc{
 	// 在这里注册编解码器实现
-	GobCodecByte: NewGobCodec,
+	GobCodecType: NewGobCodec,
 }
 
 type ReqHeader struct {
