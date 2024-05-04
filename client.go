@@ -32,7 +32,7 @@ type Client struct {
 	codec codec.Codec
 	reqMu sync.Mutex // protects request sending
 
-	nextSeq uint64           // next request sequence number
+	nextSeq uint64           // next request sequence number, starting with 1
 	reqs    map[uint64]*Call // pending requests
 	mu      sync.Mutex       // protects nextSeq and reqs
 

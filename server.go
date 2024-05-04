@@ -6,13 +6,52 @@ import (
 	"log"
 	"net"
 	"reflect"
+	"strings"
 	"sync"
 
 	"github.com/hoywu/flexrpc/codec"
+	"github.com/hoywu/flexrpc/service"
 	"github.com/hoywu/flexrpc/transport"
 )
 
-type Server struct{}
+type Server struct {
+	serviceMap sync.Map
+}
+
+func (s *Server) Register(rcvr interface{}) error {
+	return s.RegisterName(rcvr, "")
+}
+
+func (s *Server) RegisterName(rcvr interface{}, name string) error {
+	svc := service.NewService(rcvr, name)
+	_, loaded := s.serviceMap.LoadOrStore(svc.Name, svc)
+	if loaded {
+		return fmt.Errorf("service %v already registered", svc.Name)
+	}
+	return nil
+}
+
+func (s *Server) parseCallTarget(callTarget string) (*service.Service, *service.Method, error) {
+	i := strings.LastIndex(callTarget, ".")
+	if i < 0 {
+		return nil, nil, fmt.Errorf("invalid target: %v", callTarget)
+	}
+
+	svcName := callTarget[:i]
+	methodName := callTarget[i+1:]
+
+	value, ok := s.serviceMap.Load(svcName)
+	if !ok {
+		return nil, nil, fmt.Errorf("service %v not found", svcName)
+	}
+	svc := value.(*service.Service)
+	m := svc.Methods[methodName]
+	if m == nil {
+		return nil, nil, fmt.Errorf("method %v not found", methodName)
+	}
+
+	return svc, m, nil
+}
 
 func NewServer() *Server {
 	return &Server{}
@@ -58,18 +97,21 @@ func (s *Server) Serve(conn io.ReadWriteCloser) {
 	}
 
 	// RPC 连接建立成功，开始处理请求
-	rc := &rpcConn{codec: c(conn)}
+	rc := &rpcConn{server: s, codec: c(conn)}
 	rc.handle()
 }
 
 type rpcConn struct {
+	server *Server
 	codec  codec.Codec
 	respMu sync.Mutex
 }
 
 type rpcReq struct {
 	header codec.ReqHeader
-	arg    reflect.Value // TODO
+	svc    *service.Service
+	method *service.Method
+	arg    reflect.Value
 }
 
 type rpcResp struct {
@@ -81,21 +123,22 @@ type rpcResp struct {
 func (c *rpcConn) handle() {
 	wg := sync.WaitGroup{}
 	for {
-		// 读入 RPC 请求
 		req := &rpcReq{}
 		if err := c.readReq(req); err != nil {
 			if err == io.EOF {
 				// 连接处理完毕
 				break
 			}
-			// RPC 请求读取错误
-			log.Printf("Read request error: %v", err)
-			break
+			if req.header.Seq != 0 {
+				// 有请求序号，需要发送错误响应
+				resp := &rpcResp{err: err.Error()}
+				c.makeResp(req, resp)
+			}
+			continue
 		}
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			// 处理 RPC 请求
 			c.handleReq(req)
 		}()
 	}
@@ -103,14 +146,27 @@ func (c *rpcConn) handle() {
 	c.codec.Close()
 }
 
+// 将一个 RPC 请求读入 req 中
 func (c *rpcConn) readReq(req *rpcReq) (err error) {
 	// 读取 RPC 请求头
 	if err = c.codec.ReadNext(&req.header); err != nil {
 		return
 	}
 
-	// TODO: 读取 RPC 请求参数
-	req.arg = reflect.New(reflect.TypeOf(""))
+	// 解析请求头
+	svc, m, err := c.server.parseCallTarget(req.header.CallTarget)
+	if err != nil {
+		return
+	}
+	req.svc = svc
+	req.method = m
+
+	// 读取 RPC 请求参数
+	if m.Arg.Kind() == reflect.Pointer {
+		req.arg = reflect.New(m.Arg.Elem())
+	} else {
+		req.arg = reflect.New(m.Arg)
+	}
 	if err = c.codec.ReadNext(req.arg.Interface()); err != nil {
 		return
 	}
@@ -129,11 +185,17 @@ func (c *rpcConn) handleReq(req *rpcReq) {
 		}
 	}()
 
-	// TODO: 调用 RPC 服务，将结果写入 resp
-	resp := &rpcResp{}
-	resp.val = reflect.ValueOf(fmt.Sprintf("Hello, %v", req.arg.Elem().Interface()))
+	// 调用 RPC 服务，获取结果
+	reply := reflect.New(req.method.Reply.Elem())
+	err := req.svc.Call(req.method, req.arg, reply)
 
-	// 结果准备完毕，发送 RPC 响应
+	// 封装 RPC 响应
+	resp := &rpcResp{val: reply}
+	if err != nil {
+		resp.err = err.Error()
+	}
+
+	// 发送 RPC 响应
 	c.makeResp(req, resp)
 }
 
@@ -141,10 +203,13 @@ func (c *rpcConn) makeResp(req *rpcReq, resp *rpcResp) (err error) {
 	c.respMu.Lock()
 	defer c.respMu.Unlock()
 
-	// TODO: 发送 RPC 响应
+	// 发送 RPC 响应
 	respHeader := codec.RespHeader{Seq: req.header.Seq, Err: resp.err}
 	if err = c.codec.Write(&respHeader); err != nil {
 		return
+	}
+	if !resp.val.IsValid() {
+		resp.val = reflect.ValueOf(struct{}{})
 	}
 	if err = c.codec.Write(resp.val.Interface()); err != nil {
 		return
