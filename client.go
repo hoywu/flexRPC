@@ -17,15 +17,15 @@ type ClientOpt struct {
 	Timeout   time.Duration
 }
 
-type Option func(*ClientOpt)
+type COptFunc func(*ClientOpt)
 
-func WithCodecType(codecType codec.CodecType) Option {
+func WithCodecType(codecType codec.CodecType) COptFunc {
 	return func(opt *ClientOpt) {
 		opt.CodecType = codecType
 	}
 }
 
-func WithTimeout(timeout time.Duration) Option {
+func WithTimeout(timeout time.Duration) COptFunc {
 	return func(opt *ClientOpt) {
 		opt.Timeout = timeout
 	}
@@ -62,7 +62,7 @@ type Client struct {
 	closeMu  sync.RWMutex
 }
 
-func Dial(network, address string, opts ...Option) (*Client, error) {
+func Dial(network, address string, opts ...COptFunc) (*Client, error) {
 	// 默认选项
 	opt := &ClientOpt{
 		CodecType: codec.GobCodecType,
@@ -104,7 +104,7 @@ func NewClient(conn io.ReadWriteCloser, codecType codec.CodecType, timeout time.
 		if err != nil {
 			return nil, err
 		}
-	case <-time.After(timeout):
+	case <-timeoutSignal(timeout):
 		return nil, errors.New("sending header timeout")
 	}
 
@@ -271,4 +271,11 @@ func (c *Client) IsAvailable() bool {
 
 func (c *Call) done() {
 	c.Done <- c
+}
+
+func timeoutSignal(timeout time.Duration) <-chan time.Time {
+	if timeout <= 0 {
+		return nil
+	}
+	return time.After(timeout)
 }
