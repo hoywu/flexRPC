@@ -5,10 +5,30 @@ import (
 	"io"
 	"net"
 	"sync"
+	"time"
 
 	"github.com/hoywu/flexrpc/codec"
 	"github.com/hoywu/flexrpc/transport"
 )
+
+type ClientOpt struct {
+	CodecType codec.CodecType
+	Timeout   time.Duration
+}
+
+type Option func(*ClientOpt)
+
+func WithCodecType(codecType codec.CodecType) Option {
+	return func(opt *ClientOpt) {
+		opt.CodecType = codecType
+	}
+}
+
+func WithTimeout(timeout time.Duration) Option {
+	return func(opt *ClientOpt) {
+		opt.Timeout = timeout
+	}
+}
 
 type Call struct {
 	Seq        uint64
@@ -41,23 +61,24 @@ type Client struct {
 	closeMu  sync.RWMutex
 }
 
-func Dial(network, address string) (*Client, error) {
-	conn, err := net.Dial(network, address)
+func Dial(network, address string, opts ...Option) (*Client, error) {
+	// 默认选项
+	opt := &ClientOpt{
+		CodecType: codec.GobCodecType,
+		Timeout:   0,
+	}
+	for _, o := range opts {
+		o(opt)
+	}
+
+	conn, err := net.DialTimeout(network, address, opt.Timeout)
 	if err != nil {
 		return nil, err
 	}
-	return NewClient(conn, codec.GobCodecType)
+	return NewClient(conn, opt.CodecType, opt.Timeout)
 }
 
-func DialCodec(network, address string, codecType codec.CodecType) (*Client, error) {
-	conn, err := net.Dial(network, address)
-	if err != nil {
-		return nil, err
-	}
-	return NewClient(conn, codecType)
-}
-
-func NewClient(conn io.ReadWriteCloser, codecType codec.CodecType) (*Client, error) {
+func NewClient(conn io.ReadWriteCloser, codecType codec.CodecType, timeout time.Duration) (*Client, error) {
 	codec := codec.CodecImpl[codecType]
 	if codec == nil {
 		return nil, ErrCodecType
@@ -70,9 +91,23 @@ func NewClient(conn io.ReadWriteCloser, codecType codec.CodecType) (*Client, err
 	}
 
 	// 创建客户端时，发送协议头建立连接
-	if err := transport.NewHeaderEncoder(conn).Encode(codecType); err != nil {
-		return nil, err
+	ch := make(chan error)
+	go func() {
+		ch <- transport.NewHeaderEncoder(conn).Encode(codecType)
+		close(ch)
+	}()
+
+	// 等待协议头发送完成
+	select {
+	case err := <-ch:
+		if err != nil {
+			return nil, err
+		}
+	case <-time.After(timeout):
+		return nil, errors.New("sending header timeout")
 	}
+
+	// 启动接收协程
 	go c.recv()
 	return c, nil
 }
