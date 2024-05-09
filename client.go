@@ -1,6 +1,7 @@
 package flexrpc
 
 import (
+	"context"
 	"errors"
 	"io"
 	"net"
@@ -112,9 +113,15 @@ func NewClient(conn io.ReadWriteCloser, codecType codec.CodecType, timeout time.
 	return c, nil
 }
 
-func (c *Client) Call(callTarget string, args, reply any) error {
-	call := <-c.Go(callTarget, args, reply, make(chan *Call, 1)).Done
-	return call.Err
+func (c *Client) Call(ctx context.Context, callTarget string, args, reply any) error {
+	call := c.Go(callTarget, args, reply, make(chan *Call, 1))
+	select {
+	case <-call.Done:
+		return call.Err
+	case <-ctx.Done():
+		c.errCall(call.Seq, ctx.Err())
+		return ctx.Err()
+	}
 }
 
 func (c *Client) Go(callTarget string, args, reply any, done chan *Call) *Call {
