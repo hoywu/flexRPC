@@ -8,14 +8,42 @@ import (
 	"reflect"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/hoywu/flexrpc/codec"
 	"github.com/hoywu/flexrpc/service"
 	"github.com/hoywu/flexrpc/transport"
 )
 
+type ServerOpt struct {
+	ReadHeaderTimeout time.Duration
+	ConnIdleTimeout   time.Duration
+	ReadWriteTimeout  time.Duration
+}
+
+type SOptFunc func(*ServerOpt)
+
+func WithReadHeaderTimeout(timeout time.Duration) SOptFunc {
+	return func(opt *ServerOpt) {
+		opt.ReadHeaderTimeout = timeout
+	}
+}
+
+func WithConnIdleTimeout(timeout time.Duration) SOptFunc {
+	return func(opt *ServerOpt) {
+		opt.ConnIdleTimeout = timeout
+	}
+}
+
+func WithReadWriteTimeout(timeout time.Duration) SOptFunc {
+	return func(opt *ServerOpt) {
+		opt.ReadWriteTimeout = timeout
+	}
+}
+
 type Server struct {
 	serviceMap sync.Map
+	opt        *ServerOpt
 }
 
 func (s *Server) Register(rcvr interface{}) error {
@@ -54,10 +82,16 @@ func (s *Server) parseCallTarget(callTarget string) (*service.Service, *service.
 }
 
 func NewServer() *Server {
-	return &Server{}
+	return &Server{
+		opt: &ServerOpt{},
+	}
 }
 
-func (s *Server) Accept(lis net.Listener) {
+func (s *Server) Accept(lis net.Listener, opts ...SOptFunc) {
+	for _, o := range opts {
+		o(s.opt)
+	}
+
 	for {
 		conn, err := lis.Accept()
 		if err != nil {
@@ -73,11 +107,23 @@ func (s *Server) Serve(conn io.ReadWriteCloser) {
 	defer conn.Close()
 
 	var header transport.Header
-	if err := transport.NewHeaderDecoder(conn).Decode(&header); err != nil {
-		// 报文头解码错误
-		log.Printf("Decode header error: %v", err)
+	ch := make(chan error)
+	go func() {
+		ch <- transport.NewHeaderDecoder(conn).Decode(&header)
+		close(ch)
+	}()
+
+	select {
+	case err := <-ch:
+		if err != nil {
+			// 报文头解码错误
+			log.Printf("Decode header error: %v", err)
+			return
+		}
+	case <-timeoutSignal(s.opt.ReadHeaderTimeout):
 		return
 	}
+
 	if header.MagicNum != transport.MagicNum {
 		// 魔数不匹配
 		log.Printf("Invalid magic number: %x", header.MagicNum)
@@ -148,9 +194,20 @@ func (c *rpcConn) handle() {
 
 // 将一个 RPC 请求读入 req 中
 func (c *rpcConn) readReq(req *rpcReq) (err error) {
+	ch := make(chan error)
+	defer close(ch)
+
 	// 读取 RPC 请求头
-	if err = c.codec.ReadNext(&req.header); err != nil {
-		return
+	go func() {
+		ch <- c.codec.ReadNext(&req.header)
+	}()
+	select {
+	case err = <-ch:
+		if err != nil {
+			return
+		}
+	case <-timeoutSignal(c.server.opt.ConnIdleTimeout):
+		return io.EOF
 	}
 
 	// 解析请求头
@@ -167,8 +224,17 @@ func (c *rpcConn) readReq(req *rpcReq) (err error) {
 	} else {
 		req.arg = reflect.New(m.Arg)
 	}
-	if err = c.codec.ReadNext(req.arg.Interface()); err != nil {
-		return
+	go func() {
+		ch <- c.codec.ReadNext(req.arg.Interface())
+	}()
+
+	select {
+	case err = <-ch:
+		if err != nil {
+			return
+		}
+	case <-timeoutSignal(c.server.opt.ReadWriteTimeout):
+		return io.EOF
 	}
 
 	return
@@ -211,7 +277,18 @@ func (c *rpcConn) makeResp(req *rpcReq, resp *rpcResp) (err error) {
 	if !resp.val.IsValid() {
 		resp.val = reflect.ValueOf(struct{}{})
 	}
-	if err = c.codec.Write(resp.val.Interface()); err != nil {
+
+	ch := make(chan error)
+	go func() {
+		ch <- c.codec.Write(resp.val.Interface())
+	}()
+
+	select {
+	case err = <-ch:
+		if err != nil {
+			return
+		}
+	case <-timeoutSignal(c.server.opt.ReadWriteTimeout):
 		return
 	}
 	return
